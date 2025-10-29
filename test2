@@ -1,0 +1,44 @@
+flowchart TD
+
+%% === LAYER 1: INPUT ===
+A1[📤 User Uploads XLS File] --> A2[📁 /data/inbox]
+
+%% === LAYER 2: VALIDATION BOT ===
+A2 --> VB1[🤖 Validation Bot Reads File]
+VB1 --> VB2{Row Validation?}
+
+VB2 -->|✅ Valid| VB3[Write to /data/staging/csv]
+VB2 -->|❌ Invalid| VB4[Write /data/error/BRANCH_TXN_error.csv]
+
+VB1 --> VB5[(🗃 FILE_BATCH DB)]
+VB5 --> VB6[Record: total_rows, valid_rows, invalid_rows, state='INVALID']
+
+%% === LAYER 3: USER CORRECTION ===
+VB4 --> W1[🖊 Web App shows invalid rows (20 rows)]
+W1 --> W2[User edits invalid rows → save fixes]
+W2 --> W3[Revalidate (Validation Bot re-runs rules)]
+
+W3 -->|✅ All valid| VB3
+W3 -->|❌ Still invalid| VB4
+
+VB3 --> C1[🤖 Converter Bot Triggered]
+VB6 -->|state='VALID'| C1
+
+%% === LAYER 4: CONVERTER BOT ===
+C1 --> C2[Split file into parts (e.g. 10 files)]
+C2 --> C3[Generate .csv + .ctl for each part]
+C3 --> C4[(🗃 FILE_PART DB)]
+C4 --> C5[Record: part_no, row_count, state='READY']
+
+%% === LAYER 5: LOADER BOT ===
+C3 --> L1[🤖 Loader Bot runs SQL*Loader per part]
+L1 --> L2{SQL*Loader Result?}
+L2 -->|✅ Success| L3[Append to Oracle DB]
+L2 -->|❌ Rejected Rows| L4[/data/error/part_bad.csv]
+
+L4 --> W4[Web App → show rejected rows for fix]
+W4 --> W5[Fix & revalidate → partial reconvert → reload]
+
+%% === LAYER 6: ARCHIVE ===
+L3 --> AR1[📦 Move all to /data/archive]
+AR1 --> AR2[(🗃 Update FILE_BATCH.state='ARCHIVED')]
