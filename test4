@@ -1,0 +1,213 @@
+# Excel Upload System — Web UI & Bot Flow (Markdown)
+
+This document maps **8 UI pages**, **RBAC**, and the **3 backend bots (Validation, Converter, Loader)** including the **edit→revalidate loop**, approvals, audit logging, batch priority, and run control.
+
+---
+
+## 1) System Flow (End-to-End)
+
+```mermaid
+flowchart LR
+  subgraph Client[Web UI]
+    U1[Branch User\n(Page 1/2/3)]
+    A1[Branch Admin\n(Page 1/2/3/4)]
+    H1[HO User\n(Page 1/2/3/5/6/7/8)]
+  end
+
+  U1 -->|Upload .xlsx| GW[API Gateway / Web App]
+  A1 -->|Approve/Discard| GW
+  H1 -->|Batch Priority/Run Control| GW
+  H1 -->|Template Config| GW
+
+  subgraph SVC[Backend Services]
+    VBOT[Validation Bot]
+    CBOT[Converter Bot]
+    LBOT[Loader Bot]
+    SCH[Scheduler\n(CRON/Batch)]
+  end
+
+  GW -->|Persist file| FS[(File Store\n/data/uploads/...)]
+  GW -->|Write/Update| LOG[(FILE_UPLOAD_LOG)]
+  GW -->|Write| AUD[(AUDIT_LOG)]
+
+  SCH -->|Triggers| VBOT
+
+  %% Validation branch
+  GW -->|Enqueue/Trigger| VBOT
+  VBOT -->|Read .xlsx| FS
+  VBOT -->|Write row errors| ERR[(VALIDATION_ERRORS)]
+  VBOT -->|Update status| LOG
+  VBOT -->|Valid?| DEC{Valid?}
+
+  DEC -- "No" --> UIERR[UI Page 2/3 shows\nx1.xlsx • errors=5 • Edit]
+  UIERR -->|User edits rows\n(Page 3)| GW
+  GW -->|Save patched .xlsx\n(overwrite or v2)| FS
+  GW -->|Audit edit diff| AUD
+  GW -->|Re-trigger| VBOT
+  DEC -- "Yes" --> PENDAPP[Pending Approval]
+
+  %% Approval gate (Branch Admin / HO)
+  PENDAPP -->|Approve| APPR[Approved]
+  PENDAPP -->|Discard| DISC[Discarded]
+  APPR -->|Trigger| CBOT
+  DISC -->|Update status| LOG
+
+  %% Convert + Load
+  CBOT -->|XLSX→CSV/Normalized| TMP[(Staging/CSV)]
+  CBOT -->|Update status| LOG
+  CBOT -->|Trigger| LBOT
+  LBOT -->|Load to RDBMS| DB[(Core DB)]
+  LBOT -->|Update status| LOG
+  LBOT -->|Emit metrics| MON[(Metrics/Alerts)]
+
+  %% HO Batch control
+  H1 -->|Start/Stop Batch\n(Page 6)| SCH
+  H1 -->|Set Priority (Page 5)| SCH
+  SCH -->|Ordered dispatch| VBOT
+
+  %% Template config
+  H1 -->|Define XLS Template\n(Page 8)| CFG[(XLS_TEMPLATE_CFG)]
+  VBOT -->|Use template rules| CFG
+```
+
+---
+
+## 2) File Lifecycle (Status Machine)
+
+```mermaid
+stateDiagram-v2
+  [*] --> Uploaded
+  Uploaded --> Validating
+  Validating --> Invalid: Rule violations
+  Invalid --> Editing: User edits rows (Page 3)
+  Editing --> Revalidating
+  Revalidating --> Invalid
+  Revalidating --> PendingApproval: All checks passed
+  PendingApproval --> Discarded: Admin/HO discard (Page 4)
+  PendingApproval --> Approved: Admin/HO approve (Page 4)
+  Approved --> Converting
+  Converting --> Loading
+  Loading --> Loaded
+  Loaded --> Archived
+```
+
+---
+
+## 3) Role → Page Matrix (RBAC Navigation)
+
+```mermaid
+flowchart TB
+  subgraph Roles
+    RU[Branch User]
+    BA[Branch Admin]
+    HO[HO User]
+  end
+
+  subgraph Pages
+    P1[Page 1: Upload + Instant File Details]
+    P2[Page 2: Upload List + Totals + Error Counts + Edit]
+    P3[Page 3: XLS Row Editor + Save & Revalidate]
+    P4[Page 4: Approval (Approve/Discard)]
+    P5[Page 5: Batch Priority Management]
+    P6[Page 6: Batch Start/Stop/Config]
+    P7[Page 7: Dashboards (role-aware)]
+    P8[Page 8: XLS Template Config]
+  end
+
+  RU --- P1
+  RU --- P2
+  RU --- P3
+  RU --- P7
+
+  BA --- P1
+  BA --- P2
+  BA --- P3
+  BA --- P4
+  BA --- P7
+
+  HO --- P1
+  HO --- P2
+  HO --- P3
+  HO --- P4
+  HO --- P5
+  HO --- P6
+  HO --- P7
+  HO --- P8
+```
+
+---
+
+## 4) Page-by-Page UX Flow (Lean Spec)
+
+```mermaid
+flowchart LR
+  P1[Page 1: Upload] --> P1a[Inline details: filename, rows, size, quick status]
+  P1 --> P2
+  P2[Page 2: File List] -->|Click file| P3
+  P2 -->|Approve/Discard (admin)| P4
+  P3[Page 3: Row Editor] -->|Save edits| P2
+  P4[Page 4: Approval] -->|Approve→Convert| P2
+  P4 -->|Discard→Notify| P2
+  P5[Page 5: Batch Priority (HO)] --> P6
+  P6[Page 6: Start/Stop/Config (HO)] --> P2
+  P7[Page 7: Dashboards] --> P2
+  P8[Page 8: Template Config (HO)] --> P2
+```
+
+---
+
+## 5) Bots & Responsibilities (Opinionated Contract)
+
+```mermaid
+flowchart TB
+  V[Validation Bot]
+  C[Converter Bot]
+  L[Loader Bot]
+
+  subgraph Contracts
+    API1[(File meta + trigger)]
+    Q1[(Queue/Topic: validate.cmd)]
+    Q2[(Queue/Topic: convert.cmd)]
+    Q3[(Queue/Topic: load.cmd)]
+    LOG[(FILE_UPLOAD_LOG)]
+    ERR[(VALIDATION_ERRORS)]
+    AUD[(AUDIT_LOG)]
+  end
+
+  API1 --> V
+  V --> ERR
+  V --> LOG
+  V -->|on VALID + approval| Q2
+  V -->|on INVALID| LOG
+
+  Q2 --> C
+  C --> LOG
+  C --> Q3
+
+  Q3 --> L
+  L --> LOG
+  L --> AUD
+```
+
+---
+
+### 6) Key Data & Logging (for SLAs & analytics)
+
+- **FILE_UPLOAD_LOG**: `id, filename, branch_code, status, total_rows, valid_rows, invalid_rows, total_debit, total_credit, version, created_at, updated_at`
+- **VALIDATION_ERRORS**: `id, upload_id, row_no, column_name, error_code, error_msg, current_value, rule_ref, created_at`
+- **AUDIT_LOG**: `id, entity_type, entity_id, action, before_json, after_json, actor, actor_role, ip, ts`
+- **BATCH_CONFIG** (HO): `id, priority, max_parallel, schedule_cron, enabled, ts`
+- **XLS_TEMPLATE_CFG** (HO): `id, template_name, columns(json: name,type,required,regex,transform), version, enabled, ts`
+
+---
+
+### 7) UX Essentials
+
+- **Page 2**: `filename, upload_ts, total_rows, debit_sum, credit_sum, status, error_count, [Edit], [View Errors], [Approve/Discard*]` (*admins/HO*).
+- **Page 3**: grid editor with invalid-cell highlighting, inline regex/help tooltip, bulk replace, recalc, **Save & Revalidate** CTA.
+- **Page 6**: Start/Stop with dry-run & cool-down; show active runs & queue depth.
+- **Page 8**: template versioning: **draft → staged → active**.
+
+---
+
+**Security/ops**: RBAC, idempotent bots, structured logs + trace IDs, config-as-code, queue backpressure + priority, full observability.
